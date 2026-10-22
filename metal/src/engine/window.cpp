@@ -654,6 +654,49 @@ void Window::gemv(std::vector<mtl::Dispatch>& ds, const gguf::Tensor& t, const A
     if (n_in >= 6144) { L = 32; Rr = 1; S = 8; K = 2; }
     else if (n_in == 640) { L = 8; Rr = 1; S = 4; K = 1; }
     else if (n_out <= 640 || ty == ref::Q2_0 || ty == ref::BF16) { L = 32; Rr = 1; S = 4; K = 1; }
+    // decode tiles (gemv_parity --one sweeps on the die, this pack's shapes, ntok 1..4): every K-quant wants more rows
+    // in flight (LPR 8/4) than the stock grid, the multi-token windows want narrow L + K-splits, narrow BF16 rows want
+    // a K-split.  Fires only on the decode / MTP-verify windows (ntok <= 4); prompt chunk windows keep the stock tiles;
+    // the tile changes the order of the lane sums (gyro_tiles precedent).  STRATA_METAL_DECODE_TILES=0 reverts.
+    static const bool decode_tiles = !(std::getenv("STRATA_METAL_DECODE_TILES") && std::string(std::getenv("STRATA_METAL_DECODE_TILES")) == "0");
+    if (decode_tiles && ntok <= 4) {
+        const bool is_qkv  = n_in == 2560 && n_out == 10240 && (ty == ref::Q6_K || ty == ref::Q5_K || ty == ref::Q4_K || ty == ref::IQ4_XS);
+        const bool is_out  = n_in == 6144 && n_out == 2560 && (ty == ref::Q6_K || ty == ref::Q5_K || ty == ref::Q4_K);
+        const bool is_gate = n_in == 2560 && n_out == 6144 && ty != ref::BF16;
+        const bool is_head = n_in == 2560 && n_out == 248320 && ty == ref::Q6_K;
+        const bool is_hcd  = n_in == 10240 && n_out == 320 && ty == ref::BF16;
+        const bool is_hcu  = n_in == 320 && n_out == 10240 && ty == ref::BF16;
+        const bool is_ab   = n_in == 2560 && n_out == 48 && ty == ref::BF16;
+        const bool is_shu  = n_in == 2560 && n_out == 640 && (ty == ref::Q6_K || ty == ref::IQ4_XS);
+        if (is_out || is_qkv || is_gate || is_head || is_hcd || is_hcu || is_ab || is_shu)
+            { L = 16; Rr = 1; S = 4; K = 1; }   // a hit resets the stock picks fully (was: S/K leaking, gemv_14_8_1_8_2)
+        if (is_out) {                      // ssm_out / attn_output 6144->2560
+            if (ntok == 2) { L = 32; Rr = 2; }
+            else if (ntok == 3) { L = 16; S = 8; K = 4; }
+            else { L = 8; }
+        } else if (is_qkv) {               // attn/gdn qkv 2560->10240
+            if (ntok <= 2) { L = 8; Rr = 2; }
+            else if (ntok == 3) { L = 8; }
+            else { L = 4; }
+        } else if (is_gate) {              // attn/gdn gate 2560->6144
+            if (ntok <= 3) { if (ty == ref::Q6_K) { L = 16; Rr = 2; } else { L = 4; } }
+            else { L = 8; }
+        } else if (is_head) {              // LM head
+            if (ntok <= 2) { L = 8; Rr = 2; } else { L = 8; }
+        } else if (is_hcd) {               // hc down
+            if (ntok == 1) { L = 32; S = 8; K = 8; }
+            else if (ntok == 2) { L = 16; S = 8; K = 4; }
+            else { L = 32; Rr = 2; K = 2; }
+        } else if (is_hcu) {               // hc up
+            if (ntok == 2) { L = 16; }
+            else if (ntok >= 3) { L = 8; }
+        } else if (is_ab) {                // ssm alpha / beta
+            if (ntok <= 2) { L = 32; S = 8; K = 8; }
+            else { L = 16; S = 8; K = 4; }
+        } else if (is_shu) {               // shexp up
+            L = 16;
+        }
+    }
     static const bool gyro_tiles = !(std::getenv("STRATA_METAL_GYRO_TILES") && std::string(std::getenv("STRATA_METAL_GYRO_TILES")) == "0");   // off: the A/B arm
     if (gyro_dense_ && gyro_tiles && ntok >= 2) {
         // Gyro's dense weights are Q5_K / Q6_K / Q8_0 (3.6 GB a token).  gemv_parity --one on the M4, 2 tokens: Q5_K 2560->10240
