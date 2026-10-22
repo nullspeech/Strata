@@ -1225,6 +1225,9 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
     pend_fold_ = 0;
     win_head_ = head;
     auto hit = wcache_.find(key);
+    static const bool wdbg = std::getenv("STRATA_METAL_WINDBG");
+    if (wdbg) std::fprintf(stderr, "strata metal windbg: T=%d head=%d hit=%d fold=%d sel=%d hp=%d pos=%lld\n",
+                           Tn, head ? 1 : 0, hit != wcache_.end() ? 1 : 0, fold_n, sel ? 1 : 0, hp_, (long long) pos0);
     if (hit != wcache_.end()) {
         // the same window shape: only the positions change (QSA's cells, the score grid)
         Cached& c = hit->second;
