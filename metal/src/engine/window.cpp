@@ -1027,7 +1027,11 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         // the trellis gate/up: 16 lanes a row, 2 rows a lane (expert_parity --bench --sweep, M4, TQK6, 10 experts: 166.6 us a layer
         // against 174.5 for 32,2,4 and 196.8 for 32,1,4; also the fastest at 2 and 3 tokens)
         const bool tq_ = tg_.type >= 144;
-        const int gl = tq_ ? 16 : 32, gr = tq_ ? 2 : 1, gs = 4, ds_ = 4;
+        // expert_parity --bench integrated (--gucfg, 8-layer arena, top-10 routing like the engine): 16,1,4 beats the
+        // stock 32,1,4 at every ntok on this die (-10..17%: IQ2_S 86.7->77.0 ntok1, 316->265 ntok4; IQ3_XXS/IQ3_S the
+        // same) - the M4 TQK6 numbers in the comment above never promoted 16,1 beyond trellis.  STRATA_METAL_MOE_TILES=0 reverts.
+        static const bool moe_tiles = !(std::getenv("STRATA_METAL_MOE_TILES") && std::string(std::getenv("STRATA_METAL_MOE_TILES")) == "0");
+        const int gl = tq_ ? 16 : (moe_tiles ? 16 : 32), gr = tq_ ? 2 : 1, gs = 4, ds_ = 4;
         // the down tile: Q2_0 8,1; else 4,2 - but on the M4 (no M5 layout) Q5_1 4,1 and Q8_0 8,1 (4,2 spills there:
         // 24-36 GB/s, mac-kern 513fc615)
         const bool m4 = !m5_layout();
@@ -2037,7 +2041,10 @@ void Window::mtp_encode(std::vector<mtl::Dispatch>& ds, const mtl::Buffer& srcR,
         a.d_stride = (uint64_t) a.d_row * N;
         a.n_embd = N; a.n_ff = NFF; a.n_tok = 1; a.topk = TOPK; a.n_expert = NEXP;
         const bool dq2 = td.type == ref::Q2_0;
-        const int gl = 32, gr = 1, gs = 4, ds_ = 4;
+        // same gate/up tile as the main path above: 16,1,4 wins the integrated bench at every ntok on this die (the
+        // draft-chain path here is all n_tok=1, where 16,1,4 leads 32,1,4 by ~10%: IQ2_S 86.7->77.0).  Same killswitch.
+        static const bool moe_tiles = !(std::getenv("STRATA_METAL_MOE_TILES") && std::string(std::getenv("STRATA_METAL_MOE_TILES")) == "0");
+        const int gl = moe_tiles ? 16 : 32, gr = 1, gs = 4, ds_ = 4;
         // the down tile: Q2_0 8,1; else 4,2 - but on the M4 (no M5 layout) Q5_1 4,1 and Q8_0 8,1 (4,2 spills there:
         // 24-36 GB/s, mac-kern 513fc615)
         const bool m4 = !m5_layout();
@@ -2064,7 +2071,8 @@ void Window::mtp_encode(std::vector<mtl::Dispatch>& ds, const mtl::Buffer& srcR,
         const std::string dnn = "moe_down_" + std::to_string(dq2 ? 142 : td.type) + "_" + std::to_string(dl) + "_" +
                                 std::to_string(dr) + "_" + std::to_string(ds_);
         mtl::Dispatch g;
-        g.p = P(lib_, gun, mtl::Constants().b(23, metal_ctab()), gun + (metal_ctab() ? "#ct" : ""));
+        g.p = P(lib_, gun, mtl::Constants().b(23, metal_ctab()),
+                gun + (metal_ctab() ? "#ct" : ""));
         g.args = {mtl::Arg::B(Wm_), mtl::Arg::B(XF_.b, XF_.plane_bytes() * xkind(tgu.type)), mtl::Arg::B(h_), mtl::Arg::B(plan_),
                   mtl::Arg::V(a), mtl::Arg::B(XF_.b, XF_.plane_bytes() * 4)};
         g.tg[0] = 32 * gs;
