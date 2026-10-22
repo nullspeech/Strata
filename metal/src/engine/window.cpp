@@ -56,7 +56,12 @@ constexpr int N = 2560, HC = 4, LR = 320, NFF = 640, TOPK = 10, NEXP = 512, MAXT
 constexpr int P_MAXE = 128, P_GEXP = 16, P_GSTART = P_GEXP + P_MAXE, P_ETOK = P_GSTART + P_MAXE + 4,
               P_EW = P_ETOK + P_MAXE, P_TOKENT = P_EW + P_MAXE, P_INTS = P_TOKENT + P_MAXE, P_IGU = 4, P_IDN = 8;
 struct GemvArgs { uint32_t n_in, n_out, n_tok, row_bytes, x_stride, y_stride; };
-struct GrArgs { uint32_t n_embd, hc, hc_lr, n_tok, apply; float eps; };
+struct GrArgs { uint32_t n_embd, hc, hc_lr, n_tok, apply; float eps; uint32_t nsplit; };
+// gr_norm_p1's slice count over a stream row (STRATA_METAL_GR_NORM_SPLIT, default 8)
+namespace { uint32_t gr_nsplit() {
+    const char* s = std::getenv("STRATA_METAL_GR_NORM_SPLIT");
+    return s ? (uint32_t) std::max(1, std::atoi(s)) : 8u;
+} }
 struct MoeArgs {
     uint64_t gate_off, up_off, down_off, gu_stride, d_stride;
     uint32_t gu_row, d_row, n_embd, n_ff, n_tok, topk, n_expert, gx_gu, gx_dn, pad;
@@ -228,7 +233,7 @@ private:
     int64_t n_vocab_ = 0;
     float eps_ = 1e-6f;
     // buffers
-    mtl::Buffer R_, bo_, inj_[2], xn_, lo_, qkv_, z_, al_, be_, yg_, logits_, ids_, wts_, plan_, h_, ye_, gsh_, ush_,
+    mtl::Buffer R_, bo_, inj_[2], xn_, lo_, norm_part_, norm_rs_, qkv_, z_, al_, be_, yg_, logits_, ids_, wts_, plan_, h_, ye_, gsh_, ush_,
         ysh_, sg_, qfull_, kcur_, vcur_, iqr_, ikr_, qcur_, qidx_, scores_, qids_, part_, cs_, lm_, apv_, api_, tokout_,
         emb_, pkey_, pval_, qkvL_, alL_, beL_, zL_, ydump_, keyn_, qn_, gated_, normW_, pleHist_;
     Act XA_, XF_, XY_, XQ_, XH_, XE_;
@@ -501,6 +506,13 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
     max_cells_ = MAXC;
     auto A = [&](size_t bytes) { return cx_->alloc(bytes); };
     R_ = A(4 * MAXT * HC * N); bo_ = A(4 * MAXT * N); inj_[0] = A(4 * MAXT * HC); inj_[1] = A(4 * MAXT * HC);
+    norm_part_ = A(4 * (size_t) MAXT * HC); norm_rs_ = A(4 * (size_t) MAXT * HC);   // split gr_norm state (zeroed)
+    std::memset(norm_part_.ptr, 0, norm_part_.bytes);   // p1's atomic partials start at zero
+    if (std::getenv("STRATA_METAL_GR_NORM") && std::string(std::getenv("STRATA_METAL_GR_NORM")) == "0") {
+        // the folded-gr_norm fallback never writes rsbuf; the consumers still multiply by it, so make it a no-op 1.
+        float* rs1 = norm_rs_.as<float>();
+        for (size_t i = 0; i < (size_t) MAXT * HC; ++i) rs1[i] = 1.0f;
+    }
     xn_ = A(4 * MAXT * HC * N); lo_ = A(4 * MAXT * LR); qkv_ = A(4 * MAXT * 10240); z_ = A(4 * MAXT * 6144);
     al_ = A(4 * MAXT * 48); be_ = A(4 * MAXT * 48); yg_ = A(4 * MAXT * 6144); logits_ = A(4 * MAXT * 512);
     ids_ = A(4 * MAXT * TOPK); wts_ = A(4 * MAXT * TOPK); plan_ = A(4 * P_INTS); h_ = A(4 * MAXT * TOPK * NFF);
@@ -742,21 +754,63 @@ void Window::xprep(std::vector<mtl::Dispatch>& ds, const mtl::Buffer& x, const A
 }
 
 // the hyper-connection read (gr.metal, 3 dispatches): the previous sublayer's write folded in when `apply`
+//
+// gr_down tile selector (STRATA_METAL_GR_DOWN=SG_KS, e.g. 4_2: instantiations 8_8 8_4 4_4 4_2 16_16 16_8; default
+// 8_4: RS=2 halves the xn re-reads - gr_parity bench ntok1 18.0 vs 19.4us, ntok4 49.1 vs 56.4 and the KPROF
+// gr_down classes 1.075+1.049 -> 0.976+0.959ms; the old 8_8 hardcode also fed the fixed grid=324 that only fits
+// RS=1) - S/K gives RS = S/K rows a threadgroup, so the grid shrinks accordingly; gr_up lanes-per-row split
+// (LPR=2 variant removed: measured slower at both ntok; the env knob with it).
+static std::pair<std::string, int> gr_dn_pick() {
+    static const std::pair<std::string, int> s = [] {
+        const char* e = std::getenv("STRATA_METAL_GR_DOWN");
+        std::string v = e && e[0] ? std::string(e) : std::string("8_4");
+        int rs = 1;
+        const auto us = v.find('_');
+        if (us != std::string::npos) {
+            const int sk = std::atoi(v.c_str()), kk = std::atoi(v.c_str() + us + 1);
+            if (sk > 0 && kk > 0) rs = std::max(1, sk / kk);
+        }
+        return std::make_pair(v, rs);
+    }();
+    return s;
+}
 void Window::gr_read(std::vector<mtl::Dispatch>& ds, const std::string& pre, bool apply, const Act& out, bool final_,
                      int ntok) {
     const gguf::Tensor& tn = T(pre + "_norm.weight");
     const gguf::Tensor& tdn = T(pre + "_down.weight");
     const gguf::Tensor& tup = T(pre + "_up.weight");
     const gguf::Tensor& tin = final_ ? tdn : T(pre + "_inject.weight");
-    GrArgs a{N, HC, LR, (uint32_t) ntok, apply ? 1u : 0u, eps_};
-    mtl::Dispatch d1;
-    d1.p = P(lib_, "gr_norm", {}, "gr_norm");
-    d1.args = {mtl::Arg::B(R_), mtl::Arg::B(bo_), mtl::Arg::B(inj_[cur_inj_]), mtl::Arg::B(W_, tn.offset), mtl::Arg::B(xn_),
-               mtl::Arg::V(a)};
-    d1.grid[0] = HC;
-    d1.grid[1] = ntok;
-    d1.tg[0] = 256;
-    push(ds, d1);
+    GrArgs a{N, HC, LR, (uint32_t) ntok, apply ? 1u : 0u, eps_, gr_nsplit()};
+    // gr_norm split (STRATA_METAL_GR_NORM=0 falls back): p1 (grid hc*8 x ntok) writes xn = (R + bo*g) * w_norm
+    // with per-stream partial sums, p2 reduces them into norm_rs_ (and zeroes the partials), the down/up
+    // kernels apply rs themselves.  Same rounding as the folded gr_norm; 8x the threadgroups at n_tok = 1.
+    static const bool gsplit_norm = !(std::getenv("STRATA_METAL_GR_NORM") && std::string(std::getenv("STRATA_METAL_GR_NORM")) == "0");
+    const uint32_t gsplits = gr_nsplit();
+    for (int pass = 0; pass < (gsplit_norm ? 2 : 1); ++pass) {
+        mtl::Dispatch d1;
+        if (pass == 0) {
+            if (gsplit_norm) {
+                d1.p = P(lib_, "gr_norm_p1", {}, "gr_norm_p1");
+                d1.args = {mtl::Arg::B(R_), mtl::Arg::B(bo_), mtl::Arg::B(inj_[cur_inj_]), mtl::Arg::B(W_, tn.offset),
+                           mtl::Arg::B(xn_), mtl::Arg::V(a), mtl::Arg::B(norm_part_)};
+                d1.grid[0] = HC * gsplits;
+            } else {
+                d1.p = P(lib_, "gr_norm", {}, "gr_norm");
+                d1.args = {mtl::Arg::B(R_), mtl::Arg::B(bo_), mtl::Arg::B(inj_[cur_inj_]), mtl::Arg::B(W_, tn.offset),
+                           mtl::Arg::B(xn_), mtl::Arg::V(a)};
+                d1.grid[0] = HC;
+            }
+            d1.grid[1] = ntok;
+            d1.tg[0] = 256;
+        } else {
+            d1.p = P(lib_, "gr_norm_p2", {}, "gr_norm_p2");
+            d1.args = {mtl::Arg::B(norm_part_), mtl::Arg::B(norm_rs_), mtl::Arg::V(a)};
+            d1.grid[0] = HC;
+            d1.grid[1] = ntok;
+            d1.tg[0] = 32;
+        }
+        push(ds, d1);
+    }
     // each matrix: its load-time Q8_0 copy (q8off_), else the file's own tensor (Unsloth's are Q8_0 already, their
     // inject rows F32)
     auto src = [&](const gguf::Tensor& t) -> std::pair<const mtl::Buffer*, size_t> {
@@ -770,19 +824,21 @@ void Window::gr_read(std::vector<mtl::Dispatch>& ds, const std::string& pre, boo
     const bool q8 = is_q8(tdn) && is_q8(tup);
     const bool injf = q8 && !final_ && !q8off_.count(tin.name) && tin.type == ref::F32;
     mtl::Dispatch d2;
-    const char* dn = injf ? "gr_down_q8f_8_8" : q8 ? "gr_down_q8_8_8" : "gr_down_8_8";
-    d2.p = P(lib_, dn, mtl::Constants().i(1, ntok), std::string(dn) + "#" + std::to_string(ntok));
+    static const auto gdn = gr_dn_pick();
+    const std::string dn = std::string(injf ? "gr_down_q8f_" : q8 ? "gr_down_q8_" : "gr_down_") + gdn.first;
+    d2.p = P(lib_, dn, mtl::Constants().i(1, ntok), dn + "#" + std::to_string(ntok));
     d2.args = {mtl::Arg::B(*bd, od), mtl::Arg::B(*bi, oi), mtl::Arg::B(xn_), mtl::Arg::B(lo_),
-               mtl::Arg::B(inj_[1 - cur_inj_]), mtl::Arg::V(a)};
-    d2.grid[0] = LR + HC;
+               mtl::Arg::B(inj_[1 - cur_inj_]), mtl::Arg::B(norm_rs_), mtl::Arg::V(a)};
+    d2.grid[0] = (LR + HC) / gdn.second;
     d2.tg[0] = 256;
     push(ds, d2);
     mtl::Dispatch d3;
-    const char* up = q8 ? "gr_up_q8" : "gr_up";
-    d3.p = P(lib_, up, mtl::Constants().i(1, ntok), std::string(up) + "#" + std::to_string(ntok));
+    const std::string up = q8 ? "gr_up_q8" : "gr_up";
+    d3.p = P(lib_, up, mtl::Constants().i(1, ntok), up + "#" + std::to_string(ntok));
     GrArgs au = a;
     au.n_tok = MAXT;   // the plane stride of the prepared activation
-    d3.args = {mtl::Arg::B(*bu, ou), mtl::Arg::B(lo_), mtl::Arg::B(xn_), mtl::Arg::B(out.b), mtl::Arg::V(au)};
+    d3.args = {mtl::Arg::B(*bu, ou), mtl::Arg::B(lo_), mtl::Arg::B(xn_), mtl::Arg::B(out.b), mtl::Arg::B(norm_rs_),
+               mtl::Arg::V(au)};
     d3.grid[0] = N / 16;
     d3.tg[0] = 256;
     push(ds, d3);
@@ -1800,26 +1856,50 @@ void Window::gr_read_m(std::vector<mtl::Dispatch>& ds, const std::string& pre, m
     const gguf::Tensor& tin = final_ ? tdn : TQ(pre + ".block_inject_weight.weight");
     const bool q8 = tdn.type == ref::Q8_0 && tup.type == ref::Q8_0 && tin.type == ref::Q8_0;
     const mtl::Buffer& WB = q8 ? mq8_ : Wm_;
-    GrArgs a{N, HC, LR, (uint32_t) ntok, apply ? 1u : 0u, eps_};
-    mtl::Dispatch d1;
-    d1.p = P(lib_, "gr_norm", {}, "gr_norm");
-    d1.args = {mtl::Arg::B(Rb), mtl::Arg::B(bo), mtl::Arg::B(inj_in), mtl::Arg::B(mnorm_, NM(pre + ".hc_norm.weight")),
-               mtl::Arg::B(xn_), mtl::Arg::V(a)};
-    d1.grid[0] = HC; d1.grid[1] = ntok; d1.tg[0] = 256;
-    push(ds, d1);
+    GrArgs a{N, HC, LR, (uint32_t) ntok, apply ? 1u : 0u, eps_, gr_nsplit()};
+    // the same split gr_norm as gr_read (STRATA_METAL_GR_NORM=0 falls back); norm_part_ / norm_rs_ are shared with
+    // gr_read, which is safe: every call's p2 consumes and zeroes the partials before the next call's p1.
+    static const bool gsplit_norm = !(std::getenv("STRATA_METAL_GR_NORM") && std::string(std::getenv("STRATA_METAL_GR_NORM")) == "0");
+    const uint32_t gsplits = gr_nsplit();
+    for (int pass = 0; pass < (gsplit_norm ? 2 : 1); ++pass) {
+        mtl::Dispatch d1;
+        if (pass == 0) {
+            if (gsplit_norm) {
+                d1.p = P(lib_, "gr_norm_p1", {}, "gr_norm_p1");
+                d1.args = {mtl::Arg::B(Rb), mtl::Arg::B(bo), mtl::Arg::B(inj_in), mtl::Arg::B(mnorm_, NM(pre + ".hc_norm.weight")),
+                           mtl::Arg::B(xn_), mtl::Arg::V(a), mtl::Arg::B(norm_part_)};
+                d1.grid[0] = HC * gsplits;
+            } else {
+                d1.p = P(lib_, "gr_norm", {}, "gr_norm");
+                d1.args = {mtl::Arg::B(Rb), mtl::Arg::B(bo), mtl::Arg::B(inj_in), mtl::Arg::B(mnorm_, NM(pre + ".hc_norm.weight")),
+                           mtl::Arg::B(xn_), mtl::Arg::V(a)};
+                d1.grid[0] = HC;
+            }
+            d1.grid[1] = ntok;
+            d1.tg[0] = 256;
+        } else {
+            d1.p = P(lib_, "gr_norm_p2", {}, "gr_norm_p2");
+            d1.args = {mtl::Arg::B(norm_part_), mtl::Arg::B(norm_rs_), mtl::Arg::V(a)};
+            d1.grid[0] = HC;
+            d1.grid[1] = ntok;
+            d1.tg[0] = 32;
+        }
+        push(ds, d1);
+    }
     mtl::Dispatch d2;
-    const char* dn = q8 ? "gr_down_q8_8_8" : "gr_down_8_8";
-    d2.p = P(lib_, dn, mtl::Constants().i(1, ntok), std::string(dn) + "#" + std::to_string(ntok));
+    const std::string dn = (q8 ? "gr_down_q8_" : "gr_down_") + gr_dn_pick().first;
+    d2.p = P(lib_, dn, mtl::Constants().i(1, ntok), dn + "#" + std::to_string(ntok));
     d2.args = {mtl::Arg::B(WB, tdn.offset), mtl::Arg::B(WB, tin.offset), mtl::Arg::B(xn_), mtl::Arg::B(lo_),
-               mtl::Arg::B(inj_out), mtl::Arg::V(a)};
-    d2.grid[0] = LR + HC; d2.tg[0] = 256;
+               mtl::Arg::B(inj_out), mtl::Arg::B(norm_rs_), mtl::Arg::V(a)};
+    d2.grid[0] = (LR + HC) / gr_dn_pick().second; d2.tg[0] = 256;
     push(ds, d2);
     mtl::Dispatch d3;
-    const char* up = q8 ? "gr_up_q8" : "gr_up";
-    d3.p = P(lib_, up, mtl::Constants().i(1, ntok), std::string(up) + "#" + std::to_string(ntok));
+    const std::string up = q8 ? "gr_up_q8" : "gr_up";
+    d3.p = P(lib_, up, mtl::Constants().i(1, ntok), up + "#" + std::to_string(ntok));
     GrArgs au = a;
     au.n_tok = MAXT;
-    d3.args = {mtl::Arg::B(WB, tup.offset), mtl::Arg::B(lo_), mtl::Arg::B(xn_), mtl::Arg::B(out.b), mtl::Arg::V(au)};
+    d3.args = {mtl::Arg::B(WB, tup.offset), mtl::Arg::B(lo_), mtl::Arg::B(xn_), mtl::Arg::B(out.b), mtl::Arg::B(norm_rs_),
+               mtl::Arg::V(au)};
     d3.grid[0] = N / 16; d3.tg[0] = 256;
     push(ds, d3);
 }

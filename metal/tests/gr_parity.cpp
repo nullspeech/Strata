@@ -16,7 +16,7 @@
 
 namespace {
 constexpr int N = 2560, HC = 4, LR = 320, NIN = HC * N;
-struct GrArgs { uint32_t n_embd, hc, hc_lr, n_tok, apply; float eps; };
+struct GrArgs { uint32_t n_embd, hc, hc_lr, n_tok, apply; float eps; uint32_t nsplit; };
 double median(std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; }
 struct Err {
     double se = 0, sr = 0, mx = 0, mr = 0;
@@ -73,36 +73,68 @@ int main(int argc, char** argv) {
     mtl::Buffer R = cx.alloc(4 * MAXT * NIN), R0 = cx.alloc(4 * MAXT * NIN), bo = cx.alloc(4 * MAXT * N),
                 inj = cx.alloc(4 * MAXT * HC), xn = cx.alloc(4 * MAXT * NIN), lo = cx.alloc(4 * MAXT * LR),
                 injo = cx.alloc(4 * MAXT * HC), xp = cx.alloc(4 * (4 * MAXT * N + MAXT * N / 16)),
-                xr = cx.alloc(4 * (4 * MAXT * N + MAXT * N / 16));
+                xr = cx.alloc(4 * (4 * MAXT * N + MAXT * N / 16)),
+                part = cx.alloc(4 * MAXT * HC), rs = cx.alloc(4 * MAXT * HC);
+    std::memset(part.ptr, 0, part.bytes);   // gr_norm_p1's atomic partials start at zero (p2 re-zeroes per call)
+    if (std::getenv("GR_NORM") && std::strcmp(std::getenv("GR_NORM"), "0") == 0) {
+        // the folded-gr_norm mode never writes rs; the consumers still multiply by it, so make it a no-op 1
+        for (int i = 0; i < MAXT * HC; ++i) rs.as<float>()[i] = 1.0f;
+    }
     for (int i = 0; i < MAXT * NIN; ++i) R0.as<float>()[i] = rng.sym() * 2.0f;
     for (int i = 0; i < MAXT * N; ++i) bo.as<float>()[i] = rng.sym();
     for (int i = 0; i < MAXT * HC; ++i) inj.as<float>()[i] = rng.sym() * 3.0f;
     mtl::Pipeline pprep = cx.pipeline(lib, "xprep");
     int fails = 0;
     for (int nt : ntoks) {
+        // GR_NORM=0 selects the folded gr_norm (the engine's STRATA_METAL_GR_NORM=0 fallback); default = the split
+        // gr_norm_p1 + gr_norm_p2, whose rsbuf is applied by the consumers (gr_down per unit, gr_up per stream)
+        const bool split = std::strcmp(std::getenv("GR_NORM") ? std::getenv("GR_NORM") : "1", "0") != 0;
         mtl::Pipeline pn = cx.pipeline(lib, "gr_norm"),
+                      pn1 = cx.pipeline(lib, "gr_norm_p1"),
+                      pn2 = cx.pipeline(lib, "gr_norm_p2"),
                       pd = cx.pipeline(lib, std::string(injf ? "gr_down_q8f_" : q8 ? "gr_down_q8_" : "gr_down_") + grd, mtl::Constants().i(1, nt)),
                       pu = cx.pipeline(lib, q8 ? "gr_up_q8" : "gr_up", mtl::Constants().i(1, nt));
         for (int apply = 0; apply < 2; ++apply) {
-            GrArgs a{N, HC, LR, (uint32_t)nt, (uint32_t)apply, 1e-6f};
+            const uint32_t nsplit = std::getenv("GR_NORM_SPLIT") ? (uint32_t) std::atoi(std::getenv("GR_NORM_SPLIT")) : 8u;
+            GrArgs a{N, HC, LR, (uint32_t)nt, (uint32_t)apply, 1e-6f, nsplit};
             std::memcpy(R.ptr, R0.ptr, R.bytes);
             auto enc = [&](int set, std::vector<mtl::Dispatch>& ds, int which) {
                 const size_t o = (size_t)set * set_bytes;
-                mtl::Dispatch d;
                 if (which & 1) {
-                    d.p = &pn;
-                    d.args = {mtl::Arg::B(R), mtl::Arg::B(bo), mtl::Arg::B(inj), mtl::Arg::B(W, o + wd_bytes + wi_bytes + wu_bytes),
-                              mtl::Arg::B(xn), mtl::Arg::V(a)};
-                    d.grid[0] = HC;
-                    d.grid[1] = nt;
-                    d.tg[0] = 256;
-                    ds.push_back(d);
+                    if (split) {
+                        mtl::Dispatch d;
+                        d.p = &pn1;
+                        d.args = {mtl::Arg::B(R), mtl::Arg::B(bo), mtl::Arg::B(inj), mtl::Arg::B(W, o + wd_bytes + wi_bytes + wu_bytes),
+                                  mtl::Arg::B(xn), mtl::Arg::V(a), mtl::Arg::B(part)};
+                        d.grid[0] = HC * (int)nsplit;
+                        d.grid[1] = nt;
+                        d.tg[0] = 256;
+                        ds.push_back(d);
+                    } else {
+                        mtl::Dispatch d;
+                        d.p = &pn;
+                        d.args = {mtl::Arg::B(R), mtl::Arg::B(bo), mtl::Arg::B(inj), mtl::Arg::B(W, o + wd_bytes + wi_bytes + wu_bytes),
+                                  mtl::Arg::B(xn), mtl::Arg::V(a)};
+                        d.grid[0] = HC;
+                        d.grid[1] = nt;
+                        d.tg[0] = 256;
+                        ds.push_back(d);
+                    }
+                    if (split) {
+                        mtl::Dispatch d2;
+                        d2.p = &pn2;
+                        d2.args = {mtl::Arg::B(part), mtl::Arg::B(rs), mtl::Arg::V(a)};
+                        d2.grid[0] = HC;
+                        d2.grid[1] = nt;
+                        d2.tg[0] = 32;
+                        ds.push_back(d2);
+                    }
                 }
                 if (which & 2) {
                     mtl::Dispatch e;
                     e.p = &pd;
                     e.args = {mtl::Arg::B(W, o), mtl::Arg::B(W, o + wd_bytes), mtl::Arg::B(xn), mtl::Arg::B(lo),
-                              mtl::Arg::B(injo), mtl::Arg::V(a)};
+                              mtl::Arg::B(injo), mtl::Arg::B(rs), mtl::Arg::V(a)};
                     e.grid[0] = (LR + HC + grd_rs - 1) / grd_rs;   // RS = SG / KS rows per threadgroup
                     e.tg[0] = 32 * grd_sg;
                     ds.push_back(e);
@@ -111,7 +143,7 @@ int main(int argc, char** argv) {
                     mtl::Dispatch f;
                     f.p = &pu;
                     f.args = {mtl::Arg::B(W, o + wd_bytes + wi_bytes), mtl::Arg::B(lo), mtl::Arg::B(xn), mtl::Arg::B(xp),
-                              mtl::Arg::V(a)};
+                              mtl::Arg::B(rs), mtl::Arg::V(a)};
                     f.grid[0] = N / 16;
                     f.tg[0] = 256;
                     ds.push_back(f);
