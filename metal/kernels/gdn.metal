@@ -7,11 +7,18 @@
 //   o_j = (sum_i S[i][j] q[i]) / sqrt(128);  y_j = o_j * rsqrt(mean(o^2) + eps) * gamma_j * sigmoid(z_j)
 //
 // State layout as Strata's: S[(i * h_v + h) * 128 + j].  Value head h reads q/k head h % h_k.
-// One threadgroup per value head, 512 threads = 16 simdgroups: simdgroup s holds columns j = 32 (s % 4) + lane and
-// rows i = 32 (s / 4) .. + 32 of the head's 128 x 128 state in registers.  GDN_NTOK tokens run in order; with
-// `commit` the state and the conv history are written back after the last one (a verify window runs without commit,
-// the fold of m accepted tokens is the same kernel with GDN_NTOK = m and commit).  The conv history is read from
-// `hist` and the committed one written to `hist_out` (ping-pong: the q/k channels are shared by three threadgroups).
+// One threadgroup per value head, IB * 128 threads (512 for gdn_step, 1024 for gdn_step8): simdgroup s holds the
+// column pair p = 32 ((s >> 1) & 1) + lane - columns j = 2 p and 2 p + 1 of the head's 128 x 128 state, as float2 -
+// and rows i = (S / IB) (s >> 2) + (S / IB / 2) (s & 1) .. (two row halves per block; state rows per thread RPTH =
+// S / (2 IB), two columns per thread, every state load and commit store one aligned float2).  GDN_NTOK tokens run
+// in order; with `commit` the state and the conv history are written back after the last one (a verify window runs
+// without commit, the fold of m accepted tokens is the same kernel with GDN_NTOK = m and commit).  The conv history
+// is read from `hist` and the committed one written to `hist_out` (ping-pong: the q/k channels are shared by three
+// threadgroups).
+// Per token 5 threadgroup barriers (norm sums + gate, q/k/v exchange, kv reduction, o reduction, output norm), +
+// 1 on the plane-on path (the prepared-planes loader of xprep needs the per-16 sum plane): the
+// kv and o row-strip partials live in separate arrays, so the o pass reuses the reduction without an overwrite
+// barrier, and the per-16 sums go through threadgroup slots instead of simd shuffles (see the y block).
 
 constant int GDN_NTOK [[function_constant(2)]];
 
@@ -43,15 +50,23 @@ kernel void gdn_step_t(device float* state [[buffer(0)]], device float* hist [[b
                      uint3 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
                      ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
     constexpr int S = 128;
+    constexpr int RPT = S / IB;     // state rows per block
+    constexpr int RPTH = RPT / 2;   // state rows per thread (two columns each)
+    constexpr int SUB = 2 * IB;     // row-strip partials of kv and o
     threadgroup float qs[S], ks[S], vs[S];
-    constexpr int RPT = S / IB;   // state rows per thread
-    threadgroup float red[IB][S];
-    threadgroup float part[32];
+    threadgroup float2 redkv[SUB][S / 2];
+    threadgroup float2 redo[SUB][S / 2];
+    threadgroup float part_n[8];
+    threadgroup float part_y[2];
     threadgroup float gb[2];
-    threadgroup float ys[S];
+    // per-16 plane sums: pair sums banked by token parity (t & 1); only the even simdgroups (sg 0 and 2) write
+    threadgroup float ps[2][96];
     const int h = int(tg.x), hk = h % int(a.h_k), hv = int(a.h_v);
-    const int cb = sg & 3, ib = sg >> 2;
-    const int j = 32 * cb + lane, i0 = RPT * ib;
+    const int ib = sg >> 2;
+    const int rh = sg & 1, cs = (sg >> 1) & 1;
+    const int p = 32 * cs + lane;
+    const int j0 = 2 * p;
+    const int i0 = RPT * ib + RPTH * rh;
     const float scale = 1.0f / sqrt(float(S));
 
     // the channel this thread convolves: 0..127 q of head hk, 128..255 k of head hk, 256..383 v of head h
@@ -64,8 +79,9 @@ kernel void gdn_step_t(device float* state [[buffer(0)]], device float* hist [[b
         for (int k = 0; k < 3; ++k) hst[k] = hist[ch * 3 + k];
         for (int k = 0; k < 4; ++k) cw[k] = conv_w[ch * 4 + k];
     }
-    float st[RPT];
-    for (int r = 0; r < RPT; ++r) st[r] = state[((i0 + r) * hv + h) * S + j];
+    float2 st[RPTH];
+    for (int r = 0; r < RPTH; ++r)
+        st[r] = *reinterpret_cast<device const float2*>(&state[((i0 + r) * hv + h) * S + j0]);
 
     const int commit_at = a.commit == 1u ? GDN_NTOK : (a.commit >> 8) ? int(a.commit & 0xFFu) : 0;
     for (int t = 0; t < GDN_NTOK; ++t) {
@@ -82,9 +98,11 @@ kernel void gdn_step_t(device float* state [[buffer(0)]], device float* hist [[b
             hst[1] = hst[2];
             hst[2] = in;
         }
-        // L2 norms of q (threads 0..127 = simdgroups 0..3) and k (128..255 = 4..7)
-        const float ssq = simd_sum(cv * cv);
-        if (lane == 0) part[sg] = ssq;
+        // L2 norm simd sums of q (threads 0..127 = simdgroups 0..3) and k (128..255 = 4..7)
+        if (tid < 256) {
+            const float ssq = simd_sum(cv * cv);
+            if (lane == 0) part_n[sg] = ssq;
+        }
         if (tid == 0) {
             const float v = alpha[t * hv + h] + dt[h];
             // log1p(e^v) (Kahan: log(u) * e / (u - 1), u = 1 + e; exact where 1 + e rounds to 1)
@@ -94,9 +112,10 @@ kernel void gdn_step_t(device float* state [[buffer(0)]], device float* hist [[b
             gb[1] = 1.0f / (1.0f + exp(-beta[t * hv + h]));
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float g = gb[0], be = gb[1];
         if (tid < 256) {
             const int base = tid < 128 ? 0 : 4;
-            const float tot = (part[base] + part[base + 1]) + (part[base + 2] + part[base + 3]);
+            const float tot = (part_n[base] + part_n[base + 1]) + (part_n[base + 2] + part_n[base + 3]);
             const float rs = rsqrt(tot / float(S) + a.eps / float(S));
             const float nv = (rs * cv) * scale;
             if (tid < 128) qs[tid] = nv;
@@ -105,47 +124,70 @@ kernel void gdn_step_t(device float* state [[buffer(0)]], device float* hist [[b
             vs[tid - 256] = cv;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        const float g = gb[0], be = gb[1];
-        // kv_j
-        float kv = 0.0f;
-        for (int r = 0; r < RPT; ++r) kv = fma(st[r], ks[i0 + r], kv);
-        red[ib][j] = kv;
+        // kv_j for both columns: the row strips' partials and the o partials live in separate arrays, so no
+        // overwrite barrier is needed between the two reductions
+        float2 kv2 = {0.0f, 0.0f};
+        for (int r = 0; r < RPTH; ++r) kv2 = fma(st[r], float2(ks[i0 + r]), kv2);
+        redkv[2 * ib + rh][p] = kv2;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        kv = 0.0f;
-        for (int k = 0; k < IB; ++k) kv += red[k][j];
-        const float delta = (vs[j] - g * kv) * be;
-        float o = 0.0f;
-        for (int r = 0; r < RPT; ++r) {
-            st[r] = fma(g, st[r], ks[i0 + r] * delta);
-            o = fma(st[r], qs[i0 + r], o);
+        kv2 = {0.0f, 0.0f};
+        for (int k = 0; k < SUB; ++k) kv2 += redkv[k][p];
+        const float2 v2 = *reinterpret_cast<threadgroup const float2*>(&vs[j0]);
+        const float2 delta2 = (v2 - float2(g) * kv2) * float2(be);
+        float2 ov = {0.0f, 0.0f};
+        for (int r = 0; r < RPTH; ++r) {
+            float2 kd = float2(ks[i0 + r]) * delta2;
+            st[r] = fma(float2(g), st[r], kd);
+            ov = fma(st[r], float2(qs[i0 + r]), ov);
+        }
+        redo[2 * ib + rh][p] = ov;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // the readout and the output norm: only the even simdgroups of block 0 (halves of columns 0..127) gather
+        float2 of = {0.0f, 0.0f};
+        if (ib == 0 && rh == 0) {
+            for (int k = 0; k < SUB; ++k) of += redo[k][p];
+            of = of * scale;
+            const float ss2 = simd_sum(of.x * of.x + of.y * of.y);
+            if (lane == 0) part_y[sg >> 1] = ss2;   // simdgroups 0 and 2: columns 0..63 and 64..127
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        red[ib][j] = o;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        // the readout and the output norm: column j's o (every i-block thread of the column holds the same value)
-        o = 0.0f;
-        for (int k = 0; k < IB; ++k) o += red[k][j];
-        o = o * scale;
-        const float osq = ib == 0 ? simd_sum(o * o) : 0.0f;
-        if (ib == 0 && lane == 0) part[cb] = osq;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (ib == 0) {
-            const float tot = (part[0] + part[1]) + (part[2] + part[3]);
+        if (ib == 0 && rh == 0) {
+            const float tot = part_y[0] + part_y[1];
             const float rs = rsqrt(tot / float(S) + a.eps);
-            const float zz = z[t * hv * S + h * S + j];
-            const float yv = ((rs * o) * gamma[j]) * (1.0f / (1.0f + exp(-zz)));
-            y[t * hv * S + h * S + j] = yv;
+            const float zz[2] = {z[t * hv * S + h * S + j0], z[t * hv * S + h * S + j0 + 1]};
+            const float gm[2] = {gamma[j0], gamma[j0 + 1]};
+            const float yv[2] = {((rs * of.x) * gm[0]) * (1.0f / (1.0f + exp(-zz[0]))),
+                                 ((rs * of.y) * gm[1]) * (1.0f / (1.0f + exp(-zz[1])))};
+            y[t * hv * S + h * S + j0] = yv[0];
+            y[t * hv * S + h * S + j0 + 1] = yv[1];
             if (a.plane) {
                 const float q2s[8] = {1.0f, 0.25f, 0.0625f, 0.015625f, 0.00390625f, 0.0009765625f, 0.000244140625f,
                                       0.00006103515625f};
                 const float p4s[4] = {1.0f, 0.00390625f, 1.52587890625e-05f, 5.9604644775390625e-08f};
-                device float* raw = y + t * hv * S + h * S + j;
-                const int jj = j & 15;
-                raw[a.plane] = yv * q2s[jj & 7];
-                raw[2 * a.plane] = yv * p4s[jj & 3];
-                raw[3 * a.plane] = (jj & 1) ? yv * 0.00390625f : yv;
-                ys[j] = yv;
+                device float* raw = y + t * hv * S + h * S + j0;
+                const int jj0 = j0 & 15, jj1 = (j0 + 1) & 15;
+                raw[a.plane] = yv[0] * q2s[jj0 & 7];
+                raw[2 * a.plane] = yv[0] * p4s[jj0 & 3];
+                raw[3 * a.plane] = (jj0 & 1) ? yv[0] * 0.00390625f : yv[0];
+                raw[1 + a.plane] = yv[1] * q2s[jj1 & 7];
+                raw[1 + 2 * a.plane] = yv[1] * p4s[jj1 & 3];
+                raw[1 + 3 * a.plane] = (jj1 & 1) ? yv[1] * 0.00390625f : yv[1];
+                // the per-16 sums through threadgroup memory: the 16 columns j0..j0+15 are lanes lane..lane+7 of
+                // this simdgroup (j0 is always even and a multiple of 16 here).  A no-barrier 3-step simd shuffle
+                // xor tree produced head-0 sums equal to only parts of three lane pairs (e.g. (y0+y1)+y4+y8, 3.2x
+                // off) on an M2 Max - cause unstudied, so this path stays explicit: the pair sums go to threadgroup
+                // slots (banked by token parity so the next token's writes cannot race a slow lane's reads), one
+                // full-threadgroup barrier right after the y block, then a sequential 8-term add (order differs
+                // from the old pairwise ys path; the parity gate checks the sum plane bitwise against this order)
+                ps[t & 1][sg * 32 + lane] = yv[0] + yv[1];
             }
+        }
+        if (a.plane) threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (a.plane && ib == 0 && rh == 0 && (j0 & 15) == 0) {
+            const threadgroup const float* pp = ps[t & 1] + sg * 32 + (lane & ~7);
+            float s16 = 0.0f;
+            for (int l = 0; l < 8; ++l) s16 += pp[l];
+            y[4 * a.plane + t * (hv * S / 16) + (h * S + j0) / 16] = s16;
         }
         if (t + 1 == commit_at) {
             // the state and the conv history after token t (registers: st after this token's update, hst after its
@@ -153,15 +195,10 @@ kernel void gdn_step_t(device float* state [[buffer(0)]], device float* hist [[b
             // h < h_k own their q/k head (h == hk); v history: every head its own - to hist_out, NOT in place: a q/k
             // channel is read by the three threadgroups h % h_k at their start, and a threadgroup may start after its
             // owner has finished (seen on the 10-core M4); the caller swaps the two
-            for (int r = 0; r < RPT; ++r) state[((i0 + r) * hv + h) * S + j] = st[r];
+            for (int r = 0; r < RPTH; ++r)
+                *reinterpret_cast<device float2*>(&state[((i0 + r) * hv + h) * S + j0]) = st[r];
             if (ch >= 0 && (tid >= 256 || h < int(a.h_k)))
                 for (int k = 0; k < 3; ++k) hist_out[ch * 3 + k] = hst[k];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (a.plane && ib == 0 && (j & 15) == 0) {
-            float s0 = 0.0f, s1 = 0.0f;
-            for (int k = 0; k < 16; k += 2) { s0 += ys[j + k]; s1 += ys[j + k + 1]; }
-            y[4 * a.plane + t * (hv * S / 16) + (h * S + j) / 16] = s0 + s1;
         }
     }
 }

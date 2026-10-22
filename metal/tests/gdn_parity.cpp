@@ -3,6 +3,9 @@
 //
 //   gdn_parity            parity for windows of 1..4 tokens: y, the committed state and conv history; a verify
 //                         window leaves the state untouched; its first m outputs are bitwise a fold of m
+//                         plus the plane-on path (the engine fuse): base y bitwise the verify window's, the three
+//                         scaled xprep planes bitwise the element products of its own y, the per-16 sums bitwise
+//                         the kernel's xor-tree order
 //   gdn_parity --bench    GPU time per layer: 36 distinct layer states rotated (113 MB, beyond the SLC)
 #include "mtl_rt.h"
 #include "ref_quant.h"
@@ -207,6 +210,58 @@ int main(int argc, char** argv) {
                     "commit y: %s, first %d of a longer window bitwise: %s, partial commits bitwise: %s  %s\n", nt, ey.l2(), es.l2(),
                     eh.l2(), untouched ? "yes" : "NO", same_y ? "yes" : "NO", nt, prefix ? "yes" : "NO", partial ? "yes" : "NO",
                     ok ? "PASS" : "FAIL");
+    }
+    // the plane-on path (the engine fuse: the caller's y buffer carries base y at [0, nt * hv * s), then three scaled
+    // xprep planes and the per-16 sums).  The three scaled planes are plain element products of the run's own y, so
+    // they must be bitwise exact; the per-16 sums use the kernel's xor-tree order ((p0+p1)+(p2+p3))+((p4+p5)+(p6+p7)),
+    // which float arithmetic reproduces bitwise
+    {
+        const uint32_t plane = MAXT * HV * S;  // MAXT * 6144, the engine's convention
+        mtl::Buffer y3 = cx.alloc(4 * (4 * (size_t)plane + MAXT * HV * S / 16));
+        auto bits = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
+        static const float q2s[8] = {1.0f, 0.25f, 0.0625f, 0.015625f, 0.00390625f, 0.0009765625f, 0.000244140625f,
+                                     0.00006103515625f};
+        static const float p4s[4] = {1.0f, 0.00390625f, 1.52587890625e-05f, 5.9604644775390625e-08f};
+        int badbase = 0, badscaled = 0, badsums = 0;
+        for (int nt = 1; nt <= 4 && !badbase && !badscaled && !badsums; ++nt) {
+            mtl::Pipeline p = cx.pipeline(lib, std::getenv("GDN_IB8") ? "gdn_step8" : "gdn_step", mtl::Constants().i(2, nt));
+            std::memcpy(state.ptr, st0.ptr, 4 * st_elems);
+            std::memcpy(hist.ptr, h0.ptr, 4 * C * 3);
+            cx.run({disp(p, 0, 0, y2)});
+            std::vector<float> ybase((float*)y2.ptr, (float*)y2.ptr + HV * S * nt);
+            GdnArgs ap{HK, HV, C, 0u, 1e-6f, plane};
+            mtl::Dispatch d;
+            d.p = &p;
+            d.args = {mtl::Arg::B(state), mtl::Arg::B(hist), mtl::Arg::B(qkv), mtl::Arg::B(al), mtl::Arg::B(be),
+                      mtl::Arg::B(z), mtl::Arg::B(cw), mtl::Arg::B(dt), mtl::Arg::B(sa), mtl::Arg::B(gm), mtl::Arg::B(y3),
+                      mtl::Arg::V(ap), mtl::Arg::B(hist2)};
+            d.grid[0] = HV;
+            d.tg[0] = std::getenv("GDN_IB8") ? 1024 : 512;
+            cx.run({d});
+            const float* yv = y3.as<float>();
+            badbase += std::memcmp(yv, ybase.data(), 4 * HV * S * nt) != 0;  // base plane == the verify window's y
+            for (int t = 0; t < nt; ++t)
+                for (int i = 0; i < HV * S; ++i) {
+                    const float v = yv[(size_t)t * HV * S + i];
+                    badscaled += bits(yv[(size_t)plane + (size_t)t * HV * S + i]) != bits(v * q2s[i & 7]) ||
+                                 bits(yv[2 * (size_t)plane + (size_t)t * HV * S + i]) != bits(v * p4s[i & 3]) ||
+                                 bits(yv[3 * (size_t)plane + (size_t)t * HV * S + i]) != bits((i & 1) ? v * 0.00390625f : v);
+                }
+            for (int t = 0; t < nt; ++t)
+                for (int i = 0; i < HV * S; i += 16) {
+                    float p[8];
+                    for (int l = 0; l < 8; ++l) p[l] = yv[(size_t)t * HV * S + i + 2 * l] + yv[(size_t)t * HV * S + i + 2 * l + 1];
+                    float s = p[0];
+                    for (int l = 1; l < 8; ++l) s += p[l];  // the kernel's order: sequential over the 8 threadgroup slots
+                    badsums += bits(yv[4 * (size_t)plane + (size_t)t * (HV * S / 16) + i / 16]) != bits(s);
+                }
+            std::printf("gdn parity plane path ntok %d: base y %s, 3 scaled planes %s, per-16 sums %s\n", nt,
+                        badbase ? "NOT bitwise" : "bitwise exact", badscaled ? "MISMATCH" : "bitwise exact",
+                        badsums ? "MISMATCH" : "bitwise exact");
+        }
+        fails += (badbase || badscaled || badsums) != 0;
+        if (badbase + badscaled + badsums)
+            std::printf("  plane path: base %d, scaled-planes %d, sums %d mismatching float(s)\n", badbase, badscaled, badsums);
     }
     std::printf("%s\n", fails ? "SOME FAILED" : "ALL PASS");
     return fails ? 1 : 0;

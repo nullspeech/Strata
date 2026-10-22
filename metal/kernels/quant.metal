@@ -366,32 +366,63 @@ template <> inline void load_tab<T_BF16>(threadgroup uint*, ushort, ushort) {}
 template <> inline void load_tab<T_F32>(threadgroup uint*, ushort, ushort) {}
 
 static inline void load_signs(threadgroup uint* tab, int at, ushort tid, ushort nth) {
-    threadgroup uchar* s = (threadgroup uchar*)(tab + at);
-    for (int i = tid; i < 128; i += nth) s[i] = ksigns_iq2xs[i];
+    // the signs sit in ggml-common's ksigns_iq2xs (128 bytes): pairwise ushort copies (threadgroup byte stores are slow)
+    threadgroup ushort* s = (threadgroup ushort*)(tab + at);
+    for (int i = tid; i < 64; i += nth) s[i] = *(constant const ushort*)&ksigns_iq2xs[2 * i];
+}
+// vectorized grid copies: `wide` = 2 words per grid entry (the IQ2 family), else 1 word per entry (IQ3).  The grids
+// are constant uint64[..]; the scalar form made one 64-bit load + one 64-bit shift + two scatter stores per entry.
+// vectorized grid copies: `wide` = 2 words per grid entry (the IQ2 family), else 1 word per entry (IQ3).  The scalar
+// form made one 64-bit load + one 64-bit shift + two scatter stores per entry.
+template <typename G>
+static inline void load_grid(threadgroup uint* tab, constant const G* g, int n, bool wide, ushort tid, ushort nth) {
+    const int pairs = n / 2;
+    if (wide) {
+        for (int i = tid; i < pairs; i += nth) {
+            const uint4 w = as_type<uint4>(*(constant const ulong2*)(g + 2 * i));
+            const int b = 4 * i;
+            tab[b] = w.x; tab[b + 1] = w.y; tab[b + 2] = w.z; tab[b + 3] = w.w;
+        }
+        if ((n & 1) && tid == 0) tab[n - 1] = g[n - 1];
+    } else {
+        constexpr int W = int(sizeof(G)) / 4;   // words per source entry (uint64 grids keep only the low word)
+        if constexpr (W == 1) {
+            for (int i = tid; i < pairs; i += nth) {
+                const uint2 w = *(constant const uint2*)(g + 2 * i);
+                tab[2 * i] = w.x; tab[2 * i + 1] = w.y;
+            }
+        } else {
+            for (int i = tid; i < pairs; i += nth) {
+                const uint4 w = as_type<uint4>(*(constant const ulong2*)(g + 2 * i));
+                tab[2 * i] = w.x; tab[2 * i + 1] = w.z;   // only the grids' low words carry the bytes
+            }
+        }
+        if ((n & 1) && tid == 0) tab[n - 1] = W == 1 ? uint(g[n - 1]) : uint(g[n - 1] >> 32);
+    }
 }
 template <> inline void load_tab<T_IQ3_XXS>(threadgroup uint* tab, ushort tid, ushort nth) {
     if (ctab) return;
-    for (int i = tid; i < 256; i += nth) tab[i] = iq3xxs_grid[i];
+    load_grid(tab, iq3xxs_grid, 256, false, tid, nth);
     load_signs(tab, 256, tid, nth);
 }
 template <> inline void load_tab<T_IQ3_S>(threadgroup uint* tab, ushort tid, ushort nth) {
     if (ctab) return;
-    for (int i = tid; i < 512; i += nth) tab[i] = iq3s_grid[i];
+    load_grid(tab, iq3s_grid, 512, false, tid, nth);
     load_signs(tab, 512, tid, nth);
 }
 template <> inline void load_tab<T_IQ2_XXS>(threadgroup uint* tab, ushort tid, ushort nth) {
     if (ctab) return;
-    for (int i = tid; i < 256; i += nth) { tab[2 * i] = uint(iq2xxs_grid[i]); tab[2 * i + 1] = uint(iq2xxs_grid[i] >> 32); }
+    load_grid(tab, iq2xxs_grid, 256, true, tid, nth);
     load_signs(tab, 512, tid, nth);
 }
 template <> inline void load_tab<T_IQ2_XS>(threadgroup uint* tab, ushort tid, ushort nth) {
     if (ctab) return;
-    for (int i = tid; i < 512; i += nth) { tab[2 * i] = uint(iq2xs_grid[i]); tab[2 * i + 1] = uint(iq2xs_grid[i] >> 32); }
+    load_grid(tab, iq2xs_grid, 512, true, tid, nth);
     load_signs(tab, 1024, tid, nth);
 }
 template <> inline void load_tab<T_IQ2_S>(threadgroup uint* tab, ushort tid, ushort nth) {
     if (ctab) return;
-    for (int i = tid; i < 1024; i += nth) { tab[2 * i] = uint(iq2s_grid[i]); tab[2 * i + 1] = uint(iq2s_grid[i] >> 32); }
+    load_grid(tab, iq2s_grid, 1024, true, tid, nth);
     load_signs(tab, 2048, tid, nth);
 }
 // IQ4: a byte -> (codebook[low nibble], codebook[high nibble]) as half2, so one lookup gives two weights

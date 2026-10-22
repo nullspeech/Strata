@@ -56,7 +56,12 @@ constexpr int N = 2560, HC = 4, LR = 320, NFF = 640, TOPK = 10, NEXP = 512, MAXT
 constexpr int P_MAXE = 128, P_GEXP = 16, P_GSTART = P_GEXP + P_MAXE, P_ETOK = P_GSTART + P_MAXE + 4,
               P_EW = P_ETOK + P_MAXE, P_TOKENT = P_EW + P_MAXE, P_INTS = P_TOKENT + P_MAXE, P_IGU = 4, P_IDN = 8;
 struct GemvArgs { uint32_t n_in, n_out, n_tok, row_bytes, x_stride, y_stride; };
-struct GrArgs { uint32_t n_embd, hc, hc_lr, n_tok, apply; float eps; };
+struct GrArgs { uint32_t n_embd, hc, hc_lr, n_tok, apply; float eps; uint32_t nsplit; };
+// gr_norm_p1's slice count over a stream row (STRATA_METAL_GR_NORM_SPLIT, default 8)
+namespace { uint32_t gr_nsplit() {
+    const char* s = std::getenv("STRATA_METAL_GR_NORM_SPLIT");
+    return s ? (uint32_t) std::max(1, std::atoi(s)) : 8u;
+} }
 struct MoeArgs {
     uint64_t gate_off, up_off, down_off, gu_stride, d_stride;
     uint32_t gu_row, d_row, n_embd, n_ff, n_tok, topk, n_expert, gx_gu, gx_dn, pad;
@@ -66,11 +71,12 @@ struct QsaArgs { uint32_t pos0, pos_base, max_cells, n_tok; float eps; };
 struct GlueArgs { uint32_t n, n_tok, n_embd, topk; };
 struct ArgArgs { uint32_t n_vocab, parts; };
 // the routed gate/up's i-quant grids from constant memory (QUANT_CTAB, function constant 23 of quant.metal): bitwise
-// the threadgroup copy's values, 3-7% faster on the M5 Max; STRATA_METAL_CTAB=0 turns it off
+// the threadgroup copy's values, 3-7% faster on the M5 Max; on the M2 Max it measured SLOWER (kprof A/B: the gu
+// classes 4.556 vs 4.338 ms, tool: gu 96.2 vs 75.6 us) - so the default is here OFF, STRATA_METAL_CTAB=1 opts in
 bool metal_ctab() {
     static const bool on = [] {
         const char* e = std::getenv("STRATA_METAL_CTAB");
-        return !(e && std::string(e) == "0");
+        return e != nullptr && std::string(e) == "1";
     }();
     return on;
 }
@@ -227,7 +233,7 @@ private:
     int64_t n_vocab_ = 0;
     float eps_ = 1e-6f;
     // buffers
-    mtl::Buffer R_, bo_, inj_[2], xn_, lo_, qkv_, z_, al_, be_, yg_, logits_, ids_, wts_, plan_, h_, ye_, gsh_, ush_,
+    mtl::Buffer R_, bo_, inj_[2], xn_, lo_, norm_part_, norm_rs_, qkv_, z_, al_, be_, yg_, logits_, ids_, wts_, plan_, h_, ye_, gsh_, ush_,
         ysh_, sg_, qfull_, kcur_, vcur_, iqr_, ikr_, qcur_, qidx_, scores_, qids_, part_, cs_, lm_, apv_, api_, tokout_,
         emb_, pkey_, pval_, qkvL_, alL_, beL_, zL_, ydump_, keyn_, qn_, gated_, normW_, pleHist_;
     Act XA_, XF_, XY_, XQ_, XH_, XE_;
@@ -500,6 +506,13 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
     max_cells_ = MAXC;
     auto A = [&](size_t bytes) { return cx_->alloc(bytes); };
     R_ = A(4 * MAXT * HC * N); bo_ = A(4 * MAXT * N); inj_[0] = A(4 * MAXT * HC); inj_[1] = A(4 * MAXT * HC);
+    norm_part_ = A(4 * (size_t) MAXT * HC); norm_rs_ = A(4 * (size_t) MAXT * HC);   // split gr_norm state (zeroed)
+    std::memset(norm_part_.ptr, 0, norm_part_.bytes);   // p1's atomic partials start at zero
+    if (std::getenv("STRATA_METAL_GR_NORM") && std::string(std::getenv("STRATA_METAL_GR_NORM")) == "0") {
+        // the folded-gr_norm fallback never writes rsbuf; the consumers still multiply by it, so make it a no-op 1.
+        float* rs1 = norm_rs_.as<float>();
+        for (size_t i = 0; i < (size_t) MAXT * HC; ++i) rs1[i] = 1.0f;
+    }
     xn_ = A(4 * MAXT * HC * N); lo_ = A(4 * MAXT * LR); qkv_ = A(4 * MAXT * 10240); z_ = A(4 * MAXT * 6144);
     al_ = A(4 * MAXT * 48); be_ = A(4 * MAXT * 48); yg_ = A(4 * MAXT * 6144); logits_ = A(4 * MAXT * 512);
     ids_ = A(4 * MAXT * TOPK); wts_ = A(4 * MAXT * TOPK); plan_ = A(4 * P_INTS); h_ = A(4 * MAXT * TOPK * NFF);
@@ -653,6 +666,55 @@ void Window::gemv(std::vector<mtl::Dispatch>& ds, const gguf::Tensor& t, const A
     if (n_in >= 6144) { L = 32; Rr = 1; S = 8; K = 2; }
     else if (n_in == 640) { L = 8; Rr = 1; S = 4; K = 1; }
     else if (n_out <= 640 || ty == ref::Q2_0 || ty == ref::BF16) { L = 32; Rr = 1; S = 4; K = 1; }
+    // decode tiles (gemv_parity --one sweeps on the die, this pack's shapes, ntok 1..4): every K-quant wants more rows
+    // in flight (LPR 8/4) than the stock grid, the multi-token windows want narrow L + K-splits, narrow BF16 rows want
+    // a K-split.  Fires only on the decode / MTP-verify windows (ntok <= 4); prompt chunk windows keep the stock tiles;
+    // the tile changes the order of the lane sums (gyro_tiles precedent).  STRATA_METAL_DECODE_TILES=0 reverts.
+    static const bool decode_tiles = !(std::getenv("STRATA_METAL_DECODE_TILES") && std::string(std::getenv("STRATA_METAL_DECODE_TILES")) == "0");
+    if (decode_tiles && ntok <= 4) {
+        const bool is_qkv  = n_in == 2560 && n_out == 10240 && (ty == ref::Q6_K || ty == ref::Q5_K || ty == ref::Q4_K || ty == ref::IQ4_XS);
+        const bool is_out  = n_in == 6144 && n_out == 2560 && (ty == ref::Q6_K || ty == ref::Q5_K || ty == ref::Q4_K);
+        const bool is_gate = n_in == 2560 && n_out == 6144 && ty != ref::BF16;
+        const bool is_head = n_in == 2560 && n_out == 248320 && ty == ref::Q6_K;
+        const bool is_hcd  = n_in == 10240 && n_out == 320 && ty == ref::BF16;
+        const bool is_hcu  = n_in == 320 && n_out == 10240 && ty == ref::BF16;
+        const bool is_ab   = n_in == 2560 && n_out == 48 && ty == ref::BF16;
+        const bool is_shu  = n_in == 2560 && n_out == 640 && (ty == ref::Q6_K || ty == ref::IQ4_XS);
+        if (is_out || is_qkv || is_gate || is_head || is_hcd || is_hcu || is_ab || is_shu)
+            { L = 16; Rr = 1; S = 4; K = 1; }   // a hit resets the stock picks fully (was: S/K leaking, gemv_14_8_1_8_2)
+        if (is_out) {                      // ssm_out / attn_output 6144->2560
+            if (ntok == 2) { L = 32; Rr = 2; }
+            else if (ntok == 3) { L = 16; S = 8; K = 4; }
+            else { L = 8; }
+        } else if (is_qkv) {               // attn/gdn qkv 2560->10240
+            if (ntok == 1) {
+                L = 8;
+                if (ty == ref::Q5_K) S = 8;    // gemv_parity --one on this pack's shape: 8_1_8_1 77.4us vs 8_2_4_1
+                                               // 92.6 (x10 rows); Q5_K's K-split likes rows in flight
+                else if (ty == ref::Q6_K) { }  // 8_1_4_1 65.5 vs 66.8 x22 rows
+                else { Rr = 2; }               // Q4_K / IQ4_XS: 8_2_4_1 stays their best (61.4 / 48.0)
+            } else if (ntok == 2) { L = 4; }   // 4_1_4_1: Q5_K 94.7 vs 114.3, Q6_K tied (89.4 vs 89.9)
+            else if (ntok == 3) { L = 8; }     // 8_1_4_1 best at nt3 for every quant (121.8 / 131.6)
+            else { L = 4; }
+        } else if (is_gate) {              // attn/gdn gate 2560->6144
+            if (ntok <= 3) { if (ty == ref::Q6_K) { L = 16; Rr = 2; } else { L = 4; } }
+            else { L = 8; }
+        } else if (is_head) {              // LM head
+            if (ntok <= 2) { L = 8; Rr = 2; } else { L = 8; }
+        } else if (is_hcd) {               // hc down
+            if (ntok == 1) { L = 32; S = 8; K = 8; }
+            else if (ntok == 2) { L = 16; S = 8; K = 4; }
+            else { L = 32; Rr = 2; K = 2; }
+        } else if (is_hcu) {               // hc up
+            if (ntok == 2) { L = 16; }
+            else if (ntok >= 3) { L = 8; }
+        } else if (is_ab) {                // ssm alpha / beta
+            if (ntok <= 2) { L = 32; S = 8; K = 8; }
+            else { L = 16; S = 8; K = 4; }
+        } else if (is_shu) {               // shexp up
+            L = 16;
+        }
+    }
     static const bool gyro_tiles = !(std::getenv("STRATA_METAL_GYRO_TILES") && std::string(std::getenv("STRATA_METAL_GYRO_TILES")) == "0");   // off: the A/B arm
     if (gyro_dense_ && gyro_tiles && ntok >= 2) {
         // Gyro's dense weights are Q5_K / Q6_K / Q8_0 (3.6 GB a token).  gemv_parity --one on the M4, 2 tokens: Q5_K 2560->10240
@@ -698,21 +760,63 @@ void Window::xprep(std::vector<mtl::Dispatch>& ds, const mtl::Buffer& x, const A
 }
 
 // the hyper-connection read (gr.metal, 3 dispatches): the previous sublayer's write folded in when `apply`
+//
+// gr_down tile selector (STRATA_METAL_GR_DOWN=SG_KS, e.g. 4_2: instantiations 8_8 8_4 4_4 4_2 16_16 16_8; default
+// 8_4: RS=2 halves the xn re-reads - gr_parity bench ntok1 18.0 vs 19.4us, ntok4 49.1 vs 56.4 and the KPROF
+// gr_down classes 1.075+1.049 -> 0.976+0.959ms; the old 8_8 hardcode also fed the fixed grid=324 that only fits
+// RS=1) - S/K gives RS = S/K rows a threadgroup, so the grid shrinks accordingly; gr_up lanes-per-row split
+// (LPR=2 variant removed: measured slower at both ntok; the env knob with it).
+static std::pair<std::string, int> gr_dn_pick() {
+    static const std::pair<std::string, int> s = [] {
+        const char* e = std::getenv("STRATA_METAL_GR_DOWN");
+        std::string v = e && e[0] ? std::string(e) : std::string("8_4");
+        int rs = 1;
+        const auto us = v.find('_');
+        if (us != std::string::npos) {
+            const int sk = std::atoi(v.c_str()), kk = std::atoi(v.c_str() + us + 1);
+            if (sk > 0 && kk > 0) rs = std::max(1, sk / kk);
+        }
+        return std::make_pair(v, rs);
+    }();
+    return s;
+}
 void Window::gr_read(std::vector<mtl::Dispatch>& ds, const std::string& pre, bool apply, const Act& out, bool final_,
                      int ntok) {
     const gguf::Tensor& tn = T(pre + "_norm.weight");
     const gguf::Tensor& tdn = T(pre + "_down.weight");
     const gguf::Tensor& tup = T(pre + "_up.weight");
     const gguf::Tensor& tin = final_ ? tdn : T(pre + "_inject.weight");
-    GrArgs a{N, HC, LR, (uint32_t) ntok, apply ? 1u : 0u, eps_};
-    mtl::Dispatch d1;
-    d1.p = P(lib_, "gr_norm", {}, "gr_norm");
-    d1.args = {mtl::Arg::B(R_), mtl::Arg::B(bo_), mtl::Arg::B(inj_[cur_inj_]), mtl::Arg::B(W_, tn.offset), mtl::Arg::B(xn_),
-               mtl::Arg::V(a)};
-    d1.grid[0] = HC;
-    d1.grid[1] = ntok;
-    d1.tg[0] = 256;
-    push(ds, d1);
+    GrArgs a{N, HC, LR, (uint32_t) ntok, apply ? 1u : 0u, eps_, gr_nsplit()};
+    // gr_norm split (STRATA_METAL_GR_NORM=0 falls back): p1 (grid hc*8 x ntok) writes xn = (R + bo*g) * w_norm
+    // with per-stream partial sums, p2 reduces them into norm_rs_ (and zeroes the partials), the down/up
+    // kernels apply rs themselves.  Same rounding as the folded gr_norm; 8x the threadgroups at n_tok = 1.
+    static const bool gsplit_norm = !(std::getenv("STRATA_METAL_GR_NORM") && std::string(std::getenv("STRATA_METAL_GR_NORM")) == "0");
+    const uint32_t gsplits = gr_nsplit();
+    for (int pass = 0; pass < (gsplit_norm ? 2 : 1); ++pass) {
+        mtl::Dispatch d1;
+        if (pass == 0) {
+            if (gsplit_norm) {
+                d1.p = P(lib_, "gr_norm_p1", {}, "gr_norm_p1");
+                d1.args = {mtl::Arg::B(R_), mtl::Arg::B(bo_), mtl::Arg::B(inj_[cur_inj_]), mtl::Arg::B(W_, tn.offset),
+                           mtl::Arg::B(xn_), mtl::Arg::V(a), mtl::Arg::B(norm_part_)};
+                d1.grid[0] = HC * gsplits;
+            } else {
+                d1.p = P(lib_, "gr_norm", {}, "gr_norm");
+                d1.args = {mtl::Arg::B(R_), mtl::Arg::B(bo_), mtl::Arg::B(inj_[cur_inj_]), mtl::Arg::B(W_, tn.offset),
+                           mtl::Arg::B(xn_), mtl::Arg::V(a)};
+                d1.grid[0] = HC;
+            }
+            d1.grid[1] = ntok;
+            d1.tg[0] = 256;
+        } else {
+            d1.p = P(lib_, "gr_norm_p2", {}, "gr_norm_p2");
+            d1.args = {mtl::Arg::B(norm_part_), mtl::Arg::B(norm_rs_), mtl::Arg::V(a)};
+            d1.grid[0] = HC;
+            d1.grid[1] = ntok;
+            d1.tg[0] = 32;
+        }
+        push(ds, d1);
+    }
     // each matrix: its load-time Q8_0 copy (q8off_), else the file's own tensor (Unsloth's are Q8_0 already, their
     // inject rows F32)
     auto src = [&](const gguf::Tensor& t) -> std::pair<const mtl::Buffer*, size_t> {
@@ -726,19 +830,21 @@ void Window::gr_read(std::vector<mtl::Dispatch>& ds, const std::string& pre, boo
     const bool q8 = is_q8(tdn) && is_q8(tup);
     const bool injf = q8 && !final_ && !q8off_.count(tin.name) && tin.type == ref::F32;
     mtl::Dispatch d2;
-    const char* dn = injf ? "gr_down_q8f_8_8" : q8 ? "gr_down_q8_8_8" : "gr_down_8_8";
-    d2.p = P(lib_, dn, mtl::Constants().i(1, ntok), std::string(dn) + "#" + std::to_string(ntok));
+    static const auto gdn = gr_dn_pick();
+    const std::string dn = std::string(injf ? "gr_down_q8f_" : q8 ? "gr_down_q8_" : "gr_down_") + gdn.first;
+    d2.p = P(lib_, dn, mtl::Constants().i(1, ntok), dn + "#" + std::to_string(ntok));
     d2.args = {mtl::Arg::B(*bd, od), mtl::Arg::B(*bi, oi), mtl::Arg::B(xn_), mtl::Arg::B(lo_),
-               mtl::Arg::B(inj_[1 - cur_inj_]), mtl::Arg::V(a)};
-    d2.grid[0] = LR + HC;
+               mtl::Arg::B(inj_[1 - cur_inj_]), mtl::Arg::B(norm_rs_), mtl::Arg::V(a)};
+    d2.grid[0] = (LR + HC) / gdn.second;
     d2.tg[0] = 256;
     push(ds, d2);
     mtl::Dispatch d3;
-    const char* up = q8 ? "gr_up_q8" : "gr_up";
-    d3.p = P(lib_, up, mtl::Constants().i(1, ntok), std::string(up) + "#" + std::to_string(ntok));
+    const std::string up = q8 ? "gr_up_q8" : "gr_up";
+    d3.p = P(lib_, up, mtl::Constants().i(1, ntok), up + "#" + std::to_string(ntok));
     GrArgs au = a;
     au.n_tok = MAXT;   // the plane stride of the prepared activation
-    d3.args = {mtl::Arg::B(*bu, ou), mtl::Arg::B(lo_), mtl::Arg::B(xn_), mtl::Arg::B(out.b), mtl::Arg::V(au)};
+    d3.args = {mtl::Arg::B(*bu, ou), mtl::Arg::B(lo_), mtl::Arg::B(xn_), mtl::Arg::B(out.b), mtl::Arg::B(norm_rs_),
+               mtl::Arg::V(au)};
     d3.grid[0] = N / 16;
     d3.tg[0] = 256;
     push(ds, d3);
@@ -927,7 +1033,11 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         // the trellis gate/up: 16 lanes a row, 2 rows a lane (expert_parity --bench --sweep, M4, TQK6, 10 experts: 166.6 us a layer
         // against 174.5 for 32,2,4 and 196.8 for 32,1,4; also the fastest at 2 and 3 tokens)
         const bool tq_ = tg_.type >= 144;
-        const int gl = tq_ ? 16 : 32, gr = tq_ ? 2 : 1, gs = 4, ds_ = 4;
+        // expert_parity --bench integrated (--gucfg, 8-layer arena, top-10 routing like the engine): 16,1,4 beats the
+        // stock 32,1,4 at every ntok on this die (-10..17%: IQ2_S 86.7->77.0 ntok1, 316->265 ntok4; IQ3_XXS/IQ3_S the
+        // same) - the M4 TQK6 numbers in the comment above never promoted 16,1 beyond trellis.  STRATA_METAL_MOE_TILES=0 reverts.
+        static const bool moe_tiles = !(std::getenv("STRATA_METAL_MOE_TILES") && std::string(std::getenv("STRATA_METAL_MOE_TILES")) == "0");
+        const int gl = tq_ ? 16 : (moe_tiles ? 16 : 32), gr = tq_ ? 2 : 1, gs = 4, ds_ = 4;
         // the down tile: Q2_0 8,1; else 4,2 - but on the M4 (no M5 layout) Q5_1 4,1 and Q8_0 8,1 (4,2 spills there:
         // 24-36 GB/s, mac-kern 513fc615)
         const bool m4 = !m5_layout();
@@ -1115,6 +1225,9 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
     pend_fold_ = 0;
     win_head_ = head;
     auto hit = wcache_.find(key);
+    static const bool wdbg = std::getenv("STRATA_METAL_WINDBG");
+    if (wdbg) std::fprintf(stderr, "strata metal windbg: T=%d head=%d hit=%d fold=%d sel=%d hp=%d pos=%lld\n",
+                           Tn, head ? 1 : 0, hit != wcache_.end() ? 1 : 0, fold_n, sel ? 1 : 0, hp_, (long long) pos0);
     if (hit != wcache_.end()) {
         // the same window shape: only the positions change (QSA's cells, the score grid)
         Cached& c = hit->second;
@@ -1756,26 +1869,50 @@ void Window::gr_read_m(std::vector<mtl::Dispatch>& ds, const std::string& pre, m
     const gguf::Tensor& tin = final_ ? tdn : TQ(pre + ".block_inject_weight.weight");
     const bool q8 = tdn.type == ref::Q8_0 && tup.type == ref::Q8_0 && tin.type == ref::Q8_0;
     const mtl::Buffer& WB = q8 ? mq8_ : Wm_;
-    GrArgs a{N, HC, LR, (uint32_t) ntok, apply ? 1u : 0u, eps_};
-    mtl::Dispatch d1;
-    d1.p = P(lib_, "gr_norm", {}, "gr_norm");
-    d1.args = {mtl::Arg::B(Rb), mtl::Arg::B(bo), mtl::Arg::B(inj_in), mtl::Arg::B(mnorm_, NM(pre + ".hc_norm.weight")),
-               mtl::Arg::B(xn_), mtl::Arg::V(a)};
-    d1.grid[0] = HC; d1.grid[1] = ntok; d1.tg[0] = 256;
-    push(ds, d1);
+    GrArgs a{N, HC, LR, (uint32_t) ntok, apply ? 1u : 0u, eps_, gr_nsplit()};
+    // the same split gr_norm as gr_read (STRATA_METAL_GR_NORM=0 falls back); norm_part_ / norm_rs_ are shared with
+    // gr_read, which is safe: every call's p2 consumes and zeroes the partials before the next call's p1.
+    static const bool gsplit_norm = !(std::getenv("STRATA_METAL_GR_NORM") && std::string(std::getenv("STRATA_METAL_GR_NORM")) == "0");
+    const uint32_t gsplits = gr_nsplit();
+    for (int pass = 0; pass < (gsplit_norm ? 2 : 1); ++pass) {
+        mtl::Dispatch d1;
+        if (pass == 0) {
+            if (gsplit_norm) {
+                d1.p = P(lib_, "gr_norm_p1", {}, "gr_norm_p1");
+                d1.args = {mtl::Arg::B(Rb), mtl::Arg::B(bo), mtl::Arg::B(inj_in), mtl::Arg::B(mnorm_, NM(pre + ".hc_norm.weight")),
+                           mtl::Arg::B(xn_), mtl::Arg::V(a), mtl::Arg::B(norm_part_)};
+                d1.grid[0] = HC * gsplits;
+            } else {
+                d1.p = P(lib_, "gr_norm", {}, "gr_norm");
+                d1.args = {mtl::Arg::B(Rb), mtl::Arg::B(bo), mtl::Arg::B(inj_in), mtl::Arg::B(mnorm_, NM(pre + ".hc_norm.weight")),
+                           mtl::Arg::B(xn_), mtl::Arg::V(a)};
+                d1.grid[0] = HC;
+            }
+            d1.grid[1] = ntok;
+            d1.tg[0] = 256;
+        } else {
+            d1.p = P(lib_, "gr_norm_p2", {}, "gr_norm_p2");
+            d1.args = {mtl::Arg::B(norm_part_), mtl::Arg::B(norm_rs_), mtl::Arg::V(a)};
+            d1.grid[0] = HC;
+            d1.grid[1] = ntok;
+            d1.tg[0] = 32;
+        }
+        push(ds, d1);
+    }
     mtl::Dispatch d2;
-    const char* dn = q8 ? "gr_down_q8_8_8" : "gr_down_8_8";
-    d2.p = P(lib_, dn, mtl::Constants().i(1, ntok), std::string(dn) + "#" + std::to_string(ntok));
+    const std::string dn = (q8 ? "gr_down_q8_" : "gr_down_") + gr_dn_pick().first;
+    d2.p = P(lib_, dn, mtl::Constants().i(1, ntok), dn + "#" + std::to_string(ntok));
     d2.args = {mtl::Arg::B(WB, tdn.offset), mtl::Arg::B(WB, tin.offset), mtl::Arg::B(xn_), mtl::Arg::B(lo_),
-               mtl::Arg::B(inj_out), mtl::Arg::V(a)};
-    d2.grid[0] = LR + HC; d2.tg[0] = 256;
+               mtl::Arg::B(inj_out), mtl::Arg::B(norm_rs_), mtl::Arg::V(a)};
+    d2.grid[0] = (LR + HC) / gr_dn_pick().second; d2.tg[0] = 256;
     push(ds, d2);
     mtl::Dispatch d3;
-    const char* up = q8 ? "gr_up_q8" : "gr_up";
-    d3.p = P(lib_, up, mtl::Constants().i(1, ntok), std::string(up) + "#" + std::to_string(ntok));
+    const std::string up = q8 ? "gr_up_q8" : "gr_up";
+    d3.p = P(lib_, up, mtl::Constants().i(1, ntok), up + "#" + std::to_string(ntok));
     GrArgs au = a;
     au.n_tok = MAXT;
-    d3.args = {mtl::Arg::B(WB, tup.offset), mtl::Arg::B(lo_), mtl::Arg::B(xn_), mtl::Arg::B(out.b), mtl::Arg::V(au)};
+    d3.args = {mtl::Arg::B(WB, tup.offset), mtl::Arg::B(lo_), mtl::Arg::B(xn_), mtl::Arg::B(out.b), mtl::Arg::B(norm_rs_),
+               mtl::Arg::V(au)};
     d3.grid[0] = N / 16; d3.tg[0] = 256;
     push(ds, d3);
 }
@@ -1913,7 +2050,10 @@ void Window::mtp_encode(std::vector<mtl::Dispatch>& ds, const mtl::Buffer& srcR,
         a.d_stride = (uint64_t) a.d_row * N;
         a.n_embd = N; a.n_ff = NFF; a.n_tok = 1; a.topk = TOPK; a.n_expert = NEXP;
         const bool dq2 = td.type == ref::Q2_0;
-        const int gl = 32, gr = 1, gs = 4, ds_ = 4;
+        // same gate/up tile as the main path above: 16,1,4 wins the integrated bench at every ntok on this die (the
+        // draft-chain path here is all n_tok=1, where 16,1,4 leads 32,1,4 by ~10%: IQ2_S 86.7->77.0).  Same killswitch.
+        static const bool moe_tiles = !(std::getenv("STRATA_METAL_MOE_TILES") && std::string(std::getenv("STRATA_METAL_MOE_TILES")) == "0");
+        const int gl = moe_tiles ? 16 : 32, gr = 1, gs = 4, ds_ = 4;
         // the down tile: Q2_0 8,1; else 4,2 - but on the M4 (no M5 layout) Q5_1 4,1 and Q8_0 8,1 (4,2 spills there:
         // 24-36 GB/s, mac-kern 513fc615)
         const bool m4 = !m5_layout();
@@ -1940,7 +2080,8 @@ void Window::mtp_encode(std::vector<mtl::Dispatch>& ds, const mtl::Buffer& srcR,
         const std::string dnn = "moe_down_" + std::to_string(dq2 ? 142 : td.type) + "_" + std::to_string(dl) + "_" +
                                 std::to_string(dr) + "_" + std::to_string(ds_);
         mtl::Dispatch g;
-        g.p = P(lib_, gun, mtl::Constants().b(23, metal_ctab()), gun + (metal_ctab() ? "#ct" : ""));
+        g.p = P(lib_, gun, mtl::Constants().b(23, metal_ctab()),
+                gun + (metal_ctab() ? "#ct" : ""));
         g.args = {mtl::Arg::B(Wm_), mtl::Arg::B(XF_.b, XF_.plane_bytes() * xkind(tgu.type)), mtl::Arg::B(h_), mtl::Arg::B(plan_),
                   mtl::Arg::V(a), mtl::Arg::B(XF_.b, XF_.plane_bytes() * 4)};
         g.tg[0] = 32 * gs;
