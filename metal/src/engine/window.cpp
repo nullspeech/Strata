@@ -66,11 +66,12 @@ struct QsaArgs { uint32_t pos0, pos_base, max_cells, n_tok; float eps; };
 struct GlueArgs { uint32_t n, n_tok, n_embd, topk; };
 struct ArgArgs { uint32_t n_vocab, parts; };
 // the routed gate/up's i-quant grids from constant memory (QUANT_CTAB, function constant 23 of quant.metal): bitwise
-// the threadgroup copy's values, 3-7% faster on the M5 Max; STRATA_METAL_CTAB=0 turns it off
+// the threadgroup copy's values, 3-7% faster on the M5 Max; on the M2 Max it measured SLOWER (kprof A/B: the gu
+// classes 4.556 vs 4.338 ms, tool: gu 96.2 vs 75.6 us) - so the default is here OFF, STRATA_METAL_CTAB=1 opts in
 bool metal_ctab() {
     static const bool on = [] {
         const char* e = std::getenv("STRATA_METAL_CTAB");
-        return !(e && std::string(e) == "0");
+        return e != nullptr && std::string(e) == "1";
     }();
     return on;
 }
