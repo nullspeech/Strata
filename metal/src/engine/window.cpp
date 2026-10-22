@@ -687,8 +687,14 @@ void Window::gemv(std::vector<mtl::Dispatch>& ds, const gguf::Tensor& t, const A
             else if (ntok == 3) { L = 16; S = 8; K = 4; }
             else { L = 8; }
         } else if (is_qkv) {               // attn/gdn qkv 2560->10240
-            if (ntok <= 2) { L = 8; Rr = 2; }
-            else if (ntok == 3) { L = 8; }
+            if (ntok == 1) {
+                L = 8;
+                if (ty == ref::Q5_K) S = 8;    // gemv_parity --one on this pack's shape: 8_1_8_1 77.4us vs 8_2_4_1
+                                               // 92.6 (x10 rows); Q5_K's K-split likes rows in flight
+                else if (ty == ref::Q6_K) { }  // 8_1_4_1 65.5 vs 66.8 x22 rows
+                else { Rr = 2; }               // Q4_K / IQ4_XS: 8_2_4_1 stays their best (61.4 / 48.0)
+            } else if (ntok == 2) { L = 4; }   // 4_1_4_1: Q5_K 94.7 vs 114.3, Q6_K tied (89.4 vs 89.9)
+            else if (ntok == 3) { L = 8; }     // 8_1_4_1 best at nt3 for every quant (121.8 / 131.6)
             else { L = 4; }
         } else if (is_gate) {              // attn/gdn gate 2560->6144
             if (ntok <= 3) { if (ty == ref::Q6_K) { L = 16; Rr = 2; } else { L = 4; } }
